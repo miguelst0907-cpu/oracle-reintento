@@ -351,8 +351,11 @@ class OciApi:
         import oci
 
         oci.config.validate_config(config)
-        return cls(oci.core.ComputeClient(config), oci.core.VirtualNetworkClient(config),
-                   oci.identity.IdentityClient(config), oci.core.models, config["tenancy"])
+        # Sin reintentos internos del SDK: con "Too many requests" se quedaba minutos esperando y la tanda de
+        # GitHub se pasaba de tiempo. Los reintentos ya los gestiona retry_create.
+        kw = dict(retry_strategy=oci.retry.NoneRetryStrategy(), timeout=(10, 60))
+        return cls(oci.core.ComputeClient(config, **kw), oci.core.VirtualNetworkClient(config, **kw),
+                   oci.identity.IdentityClient(config, **kw), oci.core.models, config["tenancy"])
 
     def availability_domains(self) -> list[str]:
         return [ad.name for ad in self.identity.list_availability_domains(compartment_id=self.tenancy).data]
