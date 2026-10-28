@@ -1,0 +1,37 @@
+name: Reintento servidor Oracle
+
+# Cada hora, en los servidores de GitHub (gratis en repositorios públicos), intenta crear el servidor
+# gratuito de Oracle durante ~50 minutos. Al conseguirlo avisa por Telegram y se desactiva solo.
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oracle
+  cancel-in-progress: false
+
+jobs:
+  reintento:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet oci cryptography
+      - id: oracle
+        env:
+          ORACLE_BUNDLE: ${{ secrets.ORACLE_BUNDLE }}
+          MAX_ATTEMPTS: "50"
+        run: python oracle_servidor.py github-run
+      - name: Desactivar al terminar
+        if: steps.oracle.outputs.result == 'creado' || steps.oracle.outputs.result == 'parar'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable "Reintento servidor Oracle" --repo "${{ github.repository }}"
