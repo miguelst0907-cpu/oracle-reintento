@@ -1,0 +1,37 @@
+name: Crear servidores pequenos (AMD)
+
+# Crea los dos servidores pequeños gratuitos (bot + IA) para tener el bot 24/7 mientras llega el ARM.
+# Se lanza a mano; si Oracle no tiene hueco, lo reintenta cada hora. Se desactiva solo al terminar.
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oracle-micros
+  cancel-in-progress: false
+
+jobs:
+  micros:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet oci cryptography
+      - id: oracle
+        env:
+          ORACLE_BUNDLE: ${{ secrets.ORACLE_BUNDLE }}
+          MAX_MINUTES: "45"
+        run: python oracle_servidor.py github-micros
+      - name: Desactivar al terminar
+        if: steps.oracle.outputs.result == 'creado' || steps.oracle.outputs.result == 'parar'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable "Crear servidores pequenos (AMD)" --repo "${{ github.repository }}"

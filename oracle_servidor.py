@@ -44,6 +44,12 @@ POLL_S = 15
 BOOT_TIMEOUT_S = 15 * 60
 GONE_STATES = {"TERMINATED", "TERMINATING"}
 
+# Servidores pequeños AMD gratuitos (casi siempre hay hueco) mientras llega el ARM
+MICRO_SHAPE = "VM.Standard.E2.1.Micro"
+MICRO_BOT = "inversor-micro-bot"      # bot + web + Tailscale; dirige la mudanza al ARM
+MICRO_IA = "inversor-micro-ia"        # FreeLLMAPI
+HOST_BOT, HOST_IA, HOST_ARM = 10, 11, 20
+
 
 class FatalError(Exception):
     """Error que no se arregla esperando (clave mal puesta, límite gratuito superado...)."""
@@ -64,6 +70,10 @@ class Plan:
     memory_gb: float = 6
     display_name: str = "inversor-ia"
     boot_gb: int = 50
+    private_ip: str | None = None
+    user_data: str | None = None
+    tags: dict | None = None
+    auto_migrate: bool = False        # el micro del bot se mudará solo a este servidor
 
 
 @dataclass
@@ -199,7 +209,11 @@ def retry_create(api, plan: Plan, *, sleep: Callable[[float], None] = time.sleep
     if not ip:
         notify("⚠️ El servidor está creado pero no tiene IP pública. Revisa la subred en Oracle.")
         raise FatalError("El servidor no tiene IP pública (¿subred privada?).")
-    notify(f"🖥️ Servidor de Oracle listo. IP pública: {ip}\nSiguiente paso: doble clic en subir_primera_vez.bat")
+    if plan.auto_migrate:
+        notify(f"🖥️ ¡Servidor ARM de Oracle listo! IP pública: {ip}\nEl bot se va a mudar solo desde los servidores "
+               f"pequeños en unos 10-20 minutos. Te aviso al terminar; no tienes que hacer nada.")
+    else:
+        notify(f"🖥️ Servidor de Oracle listo. IP pública: {ip}\nSiguiente paso: doble clic en subir_primera_vez.bat")
     return Result(instance_id, ip, attempts)
 
 
@@ -309,7 +323,7 @@ def choose_image(images):
         name = str(getattr(img, "display_name", "")).lower()
         if "minimal" not in name and "gpu" not in name:
             return img
-    raise FatalError("No encuentro una imagen de Ubuntu 24.04 ARM en tu región.")
+    raise FatalError("No encuentro una imagen de Ubuntu 24.04 para ese tipo de servidor en tu región.")
 
 
 def choose_subnet(vcns, subnets, vcn_name: str = VCN_NAME):
@@ -361,19 +375,33 @@ class OciApi:
         return choose_image(images)
 
     def launch(self, plan: Plan, ad: str) -> str:
+        import base64
+
         m = self.models
-        details = m.LaunchInstanceDetails(
+        vnic = dict(subnet_id=plan.subnet_id, assign_public_ip=True)
+        if plan.private_ip:
+            vnic["private_ip"] = plan.private_ip
+        metadata = {"ssh_authorized_keys": plan.ssh_public_key}
+        if plan.user_data:
+            metadata["user_data"] = base64.b64encode(plan.user_data.encode()).decode()
+        kw = dict(
             availability_domain=ad,
             compartment_id=plan.compartment_id,
             display_name=plan.display_name,
             shape=plan.shape,
-            shape_config=m.LaunchInstanceShapeConfigDetails(ocpus=plan.ocpus, memory_in_gbs=plan.memory_gb),
             source_details=m.InstanceSourceViaImageDetails(source_type="image", image_id=plan.image_id,
                                                            boot_volume_size_in_gbs=plan.boot_gb),
-            create_vnic_details=m.CreateVnicDetails(subnet_id=plan.subnet_id, assign_public_ip=True),
-            metadata={"ssh_authorized_keys": plan.ssh_public_key},
+            create_vnic_details=m.CreateVnicDetails(**vnic),
+            metadata=metadata,
         )
-        return self.compute.launch_instance(details).data.id
+        if plan.shape.endswith(".Flex"):  # las formas fijas (E2.1.Micro) no admiten shape_config
+            kw["shape_config"] = m.LaunchInstanceShapeConfigDetails(ocpus=plan.ocpus, memory_in_gbs=plan.memory_gb)
+        if plan.tags:
+            kw["freeform_tags"] = dict(plan.tags)
+        return self.compute.launch_instance(m.LaunchInstanceDetails(**kw)).data.id
+
+    def used_private_ips(self, subnet_id: str) -> set[str]:
+        return {p.ip_address for p in self.network.list_private_ips(subnet_id=subnet_id).data}
 
     def instance_state(self, instance_id: str) -> str:
         return self.compute.get_instance(instance_id).data.lifecycle_state
@@ -580,8 +608,11 @@ def cmd_crear() -> int:
     except Exception as e:  # noqa: BLE001
         _say(f"(Sin avisos por Telegram: {e})")
 
-    plan = Plan(compartment_id=api.tenancy, subnet_id=res["subnet_id"], image_id=res["image_id"],
-                ssh_public_key=pub)
+    try:
+        plan = arm_plan(api, pub)
+    except FatalError as e:
+        _say(f"✖ {e}")
+        return 1
     _keep_awake()
     print("\n" + "=" * 64)
     print(" Intentando crear el servidor cada ~60 s. Puede tardar horas o días.")
@@ -604,6 +635,116 @@ def cmd_crear() -> int:
     print("  doble clic en subir_primera_vez.bat (ya no te pedirá la IP).")
     print("=" * 64)
     return 0
+
+
+# ============================================ micros + mudanza al ARM ======
+def pick_ip(cidr: str, used: set[str], preferred_host: int) -> str:
+    """Primera IP privada libre de la subred a partir de la posición preferida (p. ej. 10.0.0.10)."""
+    import ipaddress
+
+    net = ipaddress.ip_network(cidr, strict=False)
+    for n in range(preferred_host, net.num_addresses - 1):
+        ip = str(net.network_address + n)
+        if ip not in used:
+            return ip
+    raise FatalError(f"No quedan IPs privadas libres en la subred {cidr}.")
+
+
+def generate_link_key() -> tuple[str, str]:
+    """Par de claves SSH para que el micro del bot pueda entrar al de IA y al ARM (mudanza automática)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    priv = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
+                             serialization.NoEncryption()).decode()
+    return priv, _public_openssh(key) + " enlace-inversor"
+
+
+def micro_user_data(rol: str, red: dict, private_key: str | None = None) -> str:
+    """Script de primer arranque (cloud-init): rol del servidor, IPs de los otros, clave de enlace y 2 GB de swap
+    (los micros solo tienen 1 GB de memoria)."""
+    env = "\n".join([f"ROL={rol}"] + [f"{k}={v}" for k, v in red.items()])
+    lines = ["#!/bin/bash", "set -e", "mkdir -p /etc/inversor",
+             f"cat > /etc/inversor/red.env <<'EOF'\n{env}\nEOF"]
+    if private_key:
+        lines += ["install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh",
+                  f"cat > /home/ubuntu/.ssh/enlace <<'EOF'\n{private_key.strip()}\nEOF",
+                  "chown ubuntu:ubuntu /home/ubuntu/.ssh/enlace", "chmod 600 /home/ubuntu/.ssh/enlace"]
+    lines += ["if [ ! -f /swapfile ]; then",
+              "  fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile",
+              "  echo '/swapfile none swap sw 0 0' >> /etc/fstab",
+              "fi", ""]
+    return "\n".join(lines)
+
+
+def _link_tags(api) -> dict:
+    bots = _alive(api.existing_instances(MICRO_BOT))
+    return dict(getattr(bots[0], "freeform_tags", None) or {}) if bots else {}
+
+
+def arm_plan(api, ssh_public_key: str) -> Plan:
+    """Plan del servidor ARM. Si existen los micros, lleva la clave de enlace y la IP privada que el micro del bot
+    espera, para que la mudanza sea automática."""
+    subnet, image = api.find_subnet(), api.find_image(Plan.shape)
+    plan = Plan(compartment_id=api.tenancy, subnet_id=subnet.id, image_id=image.id, ssh_public_key=ssh_public_key)
+    tags = _link_tags(api)
+    ip, pub = tags.get("arm_ip"), tags.get("enlace_pub")
+    if ip and pub and ip not in api.used_private_ips(subnet.id):
+        plan.private_ip = ip
+        plan.ssh_public_key = f"{ssh_public_key.strip()}\n{pub.strip()}"
+        plan.auto_migrate = True
+    return plan
+
+
+def create_micros(api, bundle: dict, notify: Callable[[str], None], max_attempts: int | None = None,
+                  max_seconds: float | None = 50 * 60, sleep: Callable[[float], None] = time.sleep,
+                  say: Callable[[str], None] = print) -> str:
+    """Crea los dos servidores pequeños gratuitos (bot e IA). Devuelve "creado", "seguir" o "parar"."""
+    try:
+        if _alive(api.existing_instances(Plan.display_name)):
+            notify("ℹ️ Ya tienes el servidor ARM: no hacen falta los servidores pequeños.")
+            return "parar"
+        subnet, image = api.find_subnet(), api.find_image(MICRO_SHAPE)
+        used = set(api.used_private_ips(subnet.id))
+        user_key = bundle["ssh_public_key"].strip()
+        base = dict(compartment_id=api.tenancy, subnet_id=subnet.id, image_id=image.id, shape=MICRO_SHAPE)
+        quiet = dict(sleep=sleep, notify=lambda m: None, say=say, max_attempts=max_attempts, max_seconds=max_seconds)
+
+        bots = _alive(api.existing_instances(MICRO_BOT))
+        if bots:
+            tags = dict(getattr(bots[0], "freeform_tags", None) or {})
+            bot = retry_create(api, Plan(**base, ssh_public_key=user_key, display_name=MICRO_BOT), **quiet)
+        else:
+            priv, pub = generate_link_key()
+            bot_ip = pick_ip(subnet.cidr_block, used, HOST_BOT)
+            ia_ip = pick_ip(subnet.cidr_block, used | {bot_ip}, HOST_IA)
+            arm_ip = pick_ip(subnet.cidr_block, used | {bot_ip, ia_ip}, HOST_ARM)
+            tags = {"enlace_pub": pub, "ia_ip": ia_ip, "arm_ip": arm_ip}
+            bot = retry_create(api, Plan(**base, ssh_public_key=user_key, display_name=MICRO_BOT, private_ip=bot_ip,
+                                         tags=tags, user_data=micro_user_data(
+                                             "bot", {"IA_IP": ia_ip, "ARM_IP": arm_ip}, private_key=priv)), **quiet)
+        ia_ip = tags.get("ia_ip")
+        ia_plan = Plan(**base, display_name=MICRO_IA, ssh_public_key=f"{user_key}\n{tags.get('enlace_pub', '').strip()}",
+                       private_ip=ia_ip if ia_ip and ia_ip not in used else None, user_data=micro_user_data("ia", {}))
+        retry_create(api, ia_plan, **quiet)
+    except GaveUp:
+        say("Sin hueco para los servidores pequeños en esta tanda.")
+        return "seguir"
+    except FatalError as e:
+        notify(f"⛔ No pude crear los servidores pequeños: {e}")
+        return "parar"
+    except Exception as e:  # noqa: BLE001
+        d = classify_error(e)
+        if d.kind == "fatal":
+            notify(f"⛔ No pude crear los servidores pequeños: {d.message}")
+            return "parar"
+        return "seguir"
+    notify(f"🖥️ ¡Servidores pequeños creados! IP del servidor del bot: {bot.ip}\n"
+           f"Siguiente paso (en tu PC): cierra el bot y la web y haz doble clic en subir_primera_vez.bat; "
+           f"cuando pida la IP, pon {bot.ip}.\nGitHub sigue buscando el servidor grande y, cuando lo consiga, "
+           f"el bot se muda solo.")
+    return "creado"
 
 
 # ===================================================== modo GitHub Actions ==
@@ -677,9 +818,7 @@ def github_round(api, bundle: dict, notify: Callable[[str], None], max_attempts:
         if _alive(api.existing_instances(Plan.display_name)):
             say("Ya existe el servidor: no hay nada que hacer.")
             return "creado"
-        subnet, image = api.find_subnet(), api.find_image(Plan.shape)
-        plan = Plan(compartment_id=api.tenancy, subnet_id=subnet.id, image_id=image.id,
-                    ssh_public_key=bundle["ssh_public_key"])
+        plan = arm_plan(api, bundle["ssh_public_key"])
         retry_create(api, plan, sleep=sleep, notify=important_only(notify), say=say, max_attempts=max_attempts,
                      max_seconds=max_seconds)
         return "creado"
@@ -697,7 +836,7 @@ def github_round(api, bundle: dict, notify: Callable[[str], None], max_attempts:
         return "seguir"
 
 
-def cmd_github_run() -> int:
+def cmd_github_run(task: str = "arm") -> int:
     """Lo ejecuta GitHub Actions. Escribe el resultado en GITHUB_OUTPUT para desactivarse al terminar."""
     import os
     import tempfile
@@ -709,7 +848,11 @@ def cmd_github_run() -> int:
         try:
             config, _ = config_from_bundle(raw, Path(tmp))
             api = OciApi.from_config(config)
-            result = github_round(api, data, notify, max_seconds=float(os.environ.get("MAX_MINUTES", "55")) * 60)
+            secs = float(os.environ.get("MAX_MINUTES", "55")) * 60
+            if task == "micros":
+                result = create_micros(api, data, notify, max_seconds=secs)
+            else:
+                result = github_round(api, data, notify, max_seconds=secs)
         except FatalError as e:
             notify(f"⛔ El reintento de Oracle en GitHub se ha parado: {e}")
             result = "parar"
@@ -755,6 +898,8 @@ def main(argv: list[str]) -> int:
     try:
         if cmd == "github-run":
             return cmd_github_run()
+        if cmd == "github-micros":
+            return cmd_github_run("micros")
         if cmd == "github":
             return cmd_github_export()
         if cmd == "configurar":
