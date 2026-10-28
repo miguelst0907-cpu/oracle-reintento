@@ -118,7 +118,8 @@ def _alive(instances) -> list:
 def retry_create(api, plan: Plan, *, sleep: Callable[[float], None] = time.sleep,
                  now: Callable[[], float] = time.monotonic, notify: Callable[[str], None] = lambda m: None,
                  say: Callable[[str], None] = print, interval: float = DEFAULT_INTERVAL_S,
-                 max_attempts: int | None = None, progress_every_s: float = PROGRESS_EVERY_S,
+                 max_attempts: int | None = None, max_seconds: float | None = None,
+                 progress_every_s: float = PROGRESS_EVERY_S,
                  poll_s: float = POLL_S, boot_timeout_s: float = BOOT_TIMEOUT_S) -> Result:
     """Intenta crear el servidor hasta conseguirlo. Devuelve su id, IP pública y nº de intentos."""
     existing = _alive(api.existing_instances(plan.display_name))
@@ -144,6 +145,8 @@ def retry_create(api, plan: Plan, *, sleep: Callable[[float], None] = time.sleep
             for ad in ads:
                 if max_attempts is not None and attempts >= max_attempts:
                     raise GaveUp(f"Sin hueco tras {attempts} intentos.")
+                if max_seconds is not None and now() - start >= max_seconds:
+                    raise GaveUp(f"Sin hueco tras {attempts} intentos ({max_seconds / 60:.0f} min).")
                 attempts += 1
                 try:
                     instance_id = api.launch(plan, ad)
@@ -167,7 +170,10 @@ def retry_create(api, plan: Plan, *, sleep: Callable[[float], None] = time.sleep
                 last_progress = now()
                 hours = (now() - start) / 3600
                 notify(f"⏳ Sigo intentándolo: {attempts} intentos en {hours:.1f} h. Oracle aún sin hueco.")
-            sleep(wait if wait is not None else interval)
+            pause = wait if wait is not None else interval
+            if max_seconds is not None:  # no esperar más allá del tiempo de la tanda
+                pause = max(0.0, min(pause, max_seconds - (now() - start)))
+            sleep(pause)
         notify(f"✅ ¡Servidor de Oracle creado tras {attempts} intentos! Arrancando...")
         say(f"¡Creado tras {attempts} intentos! Esperando a que arranque...")
 
@@ -662,7 +668,8 @@ def telegram_sender(token: str | None, chat_id: str | None) -> Callable[[str], N
     return send
 
 
-def github_round(api, bundle: dict, notify: Callable[[str], None], max_attempts: int = 50,
+def github_round(api, bundle: dict, notify: Callable[[str], None], max_attempts: int | None = None,
+                 max_seconds: float | None = 55 * 60,
                  sleep: Callable[[float], None] = time.sleep, say: Callable[[str], None] = print) -> str:
     """Una tanda de intentos. Devuelve "creado" (parar: ya hay servidor), "parar" (error que no se
     arregla esperando) o "seguir" (sin hueco todavía; la siguiente tanda lo vuelve a intentar)."""
@@ -673,7 +680,8 @@ def github_round(api, bundle: dict, notify: Callable[[str], None], max_attempts:
         subnet, image = api.find_subnet(), api.find_image(Plan.shape)
         plan = Plan(compartment_id=api.tenancy, subnet_id=subnet.id, image_id=image.id,
                     ssh_public_key=bundle["ssh_public_key"])
-        retry_create(api, plan, sleep=sleep, notify=important_only(notify), say=say, max_attempts=max_attempts)
+        retry_create(api, plan, sleep=sleep, notify=important_only(notify), say=say, max_attempts=max_attempts,
+                     max_seconds=max_seconds)
         return "creado"
     except GaveUp:
         say("Sin hueco en esta tanda. La próxima lo vuelve a intentar.")
@@ -701,7 +709,7 @@ def cmd_github_run() -> int:
         try:
             config, _ = config_from_bundle(raw, Path(tmp))
             api = OciApi.from_config(config)
-            result = github_round(api, data, notify, max_attempts=int(os.environ.get("MAX_ATTEMPTS", "50")))
+            result = github_round(api, data, notify, max_seconds=float(os.environ.get("MAX_MINUTES", "55")) * 60)
         except FatalError as e:
             notify(f"⛔ El reintento de Oracle en GitHub se ha parado: {e}")
             result = "parar"

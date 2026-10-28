@@ -1,7 +1,7 @@
 name: Reintento servidor Oracle
 
 # Cada hora, en los servidores de GitHub (gratis en repositorios públicos), intenta crear el servidor
-# gratuito de Oracle durante ~50 minutos. Al conseguirlo avisa por Telegram y se desactiva solo.
+# gratuito de Oracle durante 55 minutos. Al conseguirlo avisa por Telegram y se desactiva solo.
 on:
   schedule:
     - cron: "7 * * * *"
@@ -28,7 +28,7 @@ jobs:
       - id: oracle
         env:
           ORACLE_BUNDLE: ${{ secrets.ORACLE_BUNDLE }}
-          MAX_ATTEMPTS: "50"
+          MAX_MINUTES: "55"
         run: python oracle_servidor.py github-run
       - name: Desactivar al terminar
         if: steps.oracle.outputs.result == 'creado' || steps.oracle.outputs.result == 'parar'
